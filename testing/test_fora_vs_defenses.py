@@ -7,12 +7,13 @@ NoPeekNN and DP cannot stop a semi-honest reconstruction attack.
 This is the key empirical argument for the SL-BENCH thesis:
     "No practical defense protects against FORA while preserving utility."
 
-Five conditions are run:
+Six conditions are run:
     A) Vanilla SL           — no defense, FORA baseline
     B) NoPeekNN (λ=0.5)     — statistical independence regularization
     C) DP Gaussian σ/C=0.01 — weak noise (utility-preserving)
     D) DP Gaussian σ/C=0.1  — moderate noise
     E) DP Laplace ε=1.0     — pure DP alternative
+    F) AFO                  — adversarial feature obfuscation
 
 For each condition, the FULL FORA three-phase pipeline runs:
     Phase 1: Substitute client trains IN PARALLEL with the defended SL model.
@@ -55,6 +56,7 @@ from data import get_dataloader
 from models import create_split_simple_cnn
 from attacks.fora import FORAAttack
 from metrics.reconstruction import compute_ssim, compute_psnr, distance_correlation
+from defenses.afo import AFOTrainer
 from defenses.differential_privacy import clip_per_sample, gaussian_noise, laplace_noise
 from metrics.reconstruction import distance_correlation
 
@@ -95,6 +97,16 @@ CONDITIONS = {
         "DP Laplace ε=1.0",
         "dp_laplace",
         {"epsilon": 1.0, "clip_norm": 1.0},
+    ),
+    "afo": (
+        "AFO (ours)",
+        "afo",
+        {
+            "lambda_reconstruction": 0.05,
+            "lambda_feature": 0.02,
+            "obfuscation_strength": 0.15,
+            "recon_steps": 1,
+        },
     ),
 }
 
@@ -241,7 +253,8 @@ def train_sl_with_fora(
         train_loader:   Private training data
         fora:           Initialized FORAAttack (Phase 1 will be called here)
         epochs:         Number of SL training epochs
-        defense_type:   One of 'none', 'nopeeknn', 'dp_gaussian', 'dp_laplace'
+        defense_type:   One of 'none', 'nopeeknn', 'dp_gaussian', 'dp_laplace'.
+                        AFO uses AFOTrainer because it has trainable state.
         defense_kwargs: Defense hyperparameters
         device:         Compute device
         lr:             Learning rate
@@ -395,15 +408,20 @@ def evaluate_sl(
     server_model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    obfuscator: Optional[nn.Module] = None,
 ) -> float:
     """Return test accuracy for the trained SL model."""
     client_model.eval()
     server_model.eval()
-    criterion = nn.CrossEntropyLoss()
+    if obfuscator is not None:
+        obfuscator.eval()
     correct = total = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        out = server_model(client_model(images))
+        smashed = client_model(images)
+        if obfuscator is not None:
+            smashed = obfuscator(smashed)
+        out = server_model(smashed)
         correct += out.max(1)[1].eq(labels).sum().item()
         total   += labels.size(0)
     return correct / total
@@ -421,6 +439,7 @@ def eval_reconstruction(
     device: torch.device,
     defense_type: str,
     defense_kwargs: dict,
+    afo_obfuscator: Optional[nn.Module] = None,
     n_batches: int = 20,
 ) -> dict:
     """
@@ -434,6 +453,8 @@ def eval_reconstruction(
     """
     client_model.eval()
     fora.inverse_net.eval()
+    if afo_obfuscator is not None:
+        afo_obfuscator.eval()
 
     all_ssim  = []
     all_psnr  = []
@@ -459,6 +480,10 @@ def eval_reconstruction(
                 defense_kwargs["clip_norm"],
                 defense_kwargs["epsilon"],
             )
+        elif defense_type == "afo":
+            if afo_obfuscator is None:
+                raise ValueError("AFO reconstruction eval requires afo_obfuscator")
+            smashed_in = afo_obfuscator(smashed)
         else:
             # NoPeekNN and vanilla: FORA sees the clean smashed data
             smashed_in = smashed
@@ -532,21 +557,45 @@ def run_condition(
 
     # ── Phase 1: SL training + substitute training ────────────────────────────
     t0 = time.time()
-    sl_history = train_sl_with_fora(
-        client_model=client_model,
-        server_model=server_model,
-        train_loader=train_loader,
-        fora=fora,
-        epochs=args.sl_epochs,
-        defense_type=defense_type,
-        defense_kwargs=defense_kwargs,
-        device=device,
-        lr=args.lr,
-    )
+    afo_trainer = None
+    if defense_type == "afo":
+        afo_trainer = AFOTrainer(
+            client_model=client_model,
+            server_model=server_model,
+            train_loader=train_loader,
+            test_loader=eval_loader,
+            cut_layer=args.cut_layer,
+            lr=args.lr,
+            device=str(device),
+            **defense_kwargs,
+        )
+        sl_history = afo_trainer.train(
+            epochs=args.sl_epochs,
+            fora_attack=fora,
+            verbose=True,
+        )
+    else:
+        sl_history = train_sl_with_fora(
+            client_model=client_model,
+            server_model=server_model,
+            train_loader=train_loader,
+            fora=fora,
+            epochs=args.sl_epochs,
+            defense_type=defense_type,
+            defense_kwargs=defense_kwargs,
+            device=device,
+            lr=args.lr,
+        )
     t_sl = time.time() - t0
 
     # ── SL accuracy ───────────────────────────────────────────────────────────
-    test_acc = evaluate_sl(client_model, server_model, eval_loader, device)
+    test_acc = evaluate_sl(
+        client_model,
+        server_model,
+        eval_loader,
+        device,
+        obfuscator=afo_trainer.obfuscator if afo_trainer is not None else None,
+    )
     print(f"\n  SL training complete ({t_sl:.0f}s) | Test accuracy: {test_acc*100:.2f}%")
     print(f"  Snapshot buffer: {sum(s.shape[0] for s in fora._snapshot_list):,} samples")
 
@@ -575,6 +624,7 @@ def run_condition(
         device=device,
         defense_type=defense_type,
         defense_kwargs=defense_kwargs,
+        afo_obfuscator=afo_trainer.obfuscator if afo_trainer is not None else None,
         n_batches=args.eval_batches,
     )
 
@@ -592,6 +642,8 @@ def run_condition(
     fora.save(os.path.join(args.save_dir, f"fora_{safe_key}.pt"))
     torch.save(client_model.state_dict(),
                os.path.join(args.save_dir, f"client_{safe_key}.pt"))
+    if afo_trainer is not None:
+        afo_trainer.save_checkpoint(os.path.join(args.save_dir, f"afo_{safe_key}.pt"))
 
     return {
         "test_accuracy":   test_acc,
@@ -768,7 +820,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SL-BENCH: FORA attack evaluated against NoPeekNN and DP defenses"
+        description="SL-BENCH: FORA attack evaluated against existing defenses and AFO"
     )
 
     parser.add_argument(
@@ -776,8 +828,8 @@ if __name__ == "__main__":
         choices=ALL_CONDITION_KEYS,
         default=ALL_CONDITION_KEYS,
         help=(
-            "Which conditions to run. Default: all five. "
-            "E.g. --conditions vanilla nopeeknn dp_gaussian_weak"
+            "Which conditions to run. Default: all six. "
+            "E.g. --conditions vanilla nopeeknn dp_gaussian_weak afo"
         ),
     )
 

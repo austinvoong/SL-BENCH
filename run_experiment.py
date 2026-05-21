@@ -9,7 +9,7 @@ Actual module layout (confirmed from source):
   models/__init__.py            → create_split_simple_cnn(cut_layer, num_classes)
   trainers/__init__.py          → VanillaSplitTrainer, UShapedSplitTrainer, SplitFedTrainer
   defenses/__init__.py          → NoPeekNNTrainer, DifferentialPrivacyTrainer
-  attacks/__init__.py           → InverseNetworkAttack, FORAAttack, FSHAAttack
+  attacks/__init__.py           → InverseNetworkAttack, FORAAttack, FSHAAttack, PCATAttack
   metrics/reconstruction.py     → (used internally by attack.evaluate_full)
 
 Key design:
@@ -45,7 +45,7 @@ SMASHED_SHAPES = {
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--attack",       required=True,
-                   choices=["FORA", "FSHA", "Inverse Network"])
+                   choices=["FORA", "FSHA", "Inverse Network", "PCAT"])
     p.add_argument("--defense",      required=True,
                    choices=["None", "NoPeekNN", "DP-Gaussian", "DP-Laplace", "AFO"])
     p.add_argument("--architecture", default="Vanilla SL",
@@ -218,6 +218,56 @@ def run_fsha(cut_layer, train_loader, test_loader, epochs, tag):
     return fsha.evaluate_reconstruction(test_loader)
 
 
+def run_pcat(client_model, server_model, cut_layer, train_loader, test_loader, epochs, tag):
+    """
+    PCATAttack: semi-honest server steals client functionality with a pseudo-client.
+
+    The dedicated testing/test_pcat.py script hooks PCAT into every SL iteration
+    and is the preferred paper-faithful run. This dashboard runner uses the
+    final server model so PCAT can still be launched from the existing backend
+    without rewriting the trainer interface.
+    """
+    from attacks import PCATAttack
+
+    smashed_ch, smashed_sp = SMASHED_SHAPES[cut_layer]
+    pcat = PCATAttack(
+        smashed_channels=smashed_ch,
+        smashed_spatial=smashed_sp,
+        aux_loader=train_loader,
+        cut_layer=cut_layer,
+        lambda_moment=0.05,
+    )
+
+    pseudo_epochs = max(1, min(epochs, 10))
+
+    print(f"{tag} PCAT Phase 1 — fitting pseudo-client...", flush=True)
+    pcat.fit_pseudo_client(
+        server_model=server_model,
+        epochs=pseudo_epochs,
+        verbose=True,
+    )
+
+    print(f"{tag} PCAT Phase 2 — training reverse mapping...", flush=True)
+    pcat.train_inverse_network(epochs=20, verbose=True)
+
+    functionality = pcat.measure_functionality(
+        server_model=server_model,
+        data_loader=test_loader,
+        n_batches=10,
+    )
+    metrics = pcat.evaluate_on_loader(
+        data_loader=test_loader,
+        client_model=client_model,
+        n_batches=20,
+    )
+    print(
+        f"{tag} PCAT functionality acc="
+        f"{functionality['functionality_acc'] * 100:.2f}%",
+        flush=True,
+    )
+    return metrics
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -277,6 +327,13 @@ def main():
             metrics = run_fora(
                 trainer.client_model, args.cut_layer,
                 train_loader, test_loader, tag,
+            )
+
+        elif args.attack == "PCAT":
+            print(f"{tag} Running PCAT attack...", flush=True)
+            metrics = run_pcat(
+                trainer.client_model, trainer.server_model, args.cut_layer,
+                train_loader, test_loader, args.epochs, tag,
             )
 
     # ── Emit result JSON (Flask reads this line) ──────────────────────────────

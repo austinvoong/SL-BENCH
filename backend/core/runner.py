@@ -31,8 +31,13 @@ from core.db import get_db  # noqa: E402
 
 EXPERIMENT_SCRIPT = os.path.join(ROOT_DIR, "run_experiment.py")
 
-# Hard ceiling: 3 minutes per epoch. A 50-epoch run times out at 150 min.
+# Per-epoch ceiling for SL training (3 min/epoch is generous for MPS/CPU).
 SECONDS_PER_EPOCH = 180
+
+# Fixed overhead added to every run to cover the attack training phase.
+# The attack always trains for ~20 epochs regardless of SL epoch count,
+# so even a 1-epoch run needs ~3-4 extra minutes on MPS/CPU.
+ATTACK_OVERHEAD_SECONDS = 900  # 15 min floor
 
 
 class RunQueue:
@@ -118,7 +123,9 @@ class RunQueue:
         stderr is always captured and stored for debugging.
         """
         epochs = params.get("epochs", 10)
-        timeout = epochs * SECONDS_PER_EPOCH
+        # SL training budget + fixed attack overhead (attack trains for ~20
+        # epochs regardless of the SL epoch count passed in)
+        timeout = epochs * SECONDS_PER_EPOCH + ATTACK_OVERHEAD_SECONDS
 
         cmd = [
             sys.executable, EXPERIMENT_SCRIPT,
