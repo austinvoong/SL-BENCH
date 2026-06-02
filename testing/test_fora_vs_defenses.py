@@ -36,8 +36,10 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import os
+import random
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
@@ -51,6 +53,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
+import numpy as np
 
 from data import get_dataloader
 from models import create_split_simple_cnn
@@ -113,6 +116,73 @@ CONDITIONS = {
 ALL_CONDITION_KEYS = list(CONDITIONS.keys())
 
 
+def seed_everything(seed: Optional[int], deterministic: bool = False) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for repeatable experiments."""
+    if seed is None:
+        return
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+
+
+def reset_loader_seed(loader: DataLoader, seed: Optional[int]) -> None:
+    """Reset a DataLoader sampler generator before a condition starts."""
+    if seed is None:
+        return
+
+    sampler = getattr(loader, "sampler", None)
+    generator = getattr(sampler, "generator", None)
+    if generator is not None:
+        generator.manual_seed(seed)
+
+
+def release_torch_memory(device: torch.device) -> None:
+    """Return cached accelerator memory to the OS between long conditions."""
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
+def get_condition_config(key: str, args) -> Tuple[str, str, dict]:
+    """
+    Return a condition config, applying CLI overrides for AFO sweeps.
+    """
+    display_label, defense_type, defense_kwargs = CONDITIONS[key]
+    defense_kwargs = dict(defense_kwargs)
+
+    if defense_type == "afo":
+        overrides = {
+            "lambda_reconstruction": args.afo_lambda_reconstruction,
+            "lambda_feature": args.afo_lambda_feature,
+            "obfuscation_strength": args.afo_obfuscation_strength,
+            "recon_steps": args.afo_recon_steps,
+        }
+        for name, value in overrides.items():
+            if value is not None:
+                defense_kwargs[name] = value
+
+        display_label = (
+            "AFO "
+            f"(rec={defense_kwargs['lambda_reconstruction']}, "
+            f"feat={defense_kwargs['lambda_feature']}, "
+            f"str={defense_kwargs['obfuscation_strength']}, "
+            f"steps={defense_kwargs['recon_steps']})"
+        )
+
+    return display_label, defense_type, defense_kwargs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,6 +192,8 @@ def make_aux_loader(
     batch_size: int,
     aux_frac: float = 0.1,
     seed: int = 42,
+    num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Split the test set into auxiliary data (server's public data for FORA)
@@ -133,17 +205,21 @@ def make_aux_loader(
     n = len(test_dataset)
     n_aux = max(int(n * aux_frac), 256)
     n_eval = n - n_aux
+    split_generator = torch.Generator().manual_seed(seed)
     aux_subset, eval_subset = random_split(
         test_dataset, [n_aux, n_eval],
-        generator=torch.Generator().manual_seed(seed),
+        generator=split_generator,
     )
+    aux_generator = torch.Generator().manual_seed(seed + 1)
     aux_loader = DataLoader(
         aux_subset, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        generator=aux_generator,
     )
     eval_loader = DataLoader(
         eval_subset, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        generator=torch.Generator().manual_seed(seed + 2),
     )
     return aux_loader, eval_loader
 
@@ -531,11 +607,15 @@ def run_condition(
 
     Returns a dict of metrics for the summary table.
     """
-    display_label, defense_type, defense_kwargs = CONDITIONS[key]
+    display_label, defense_type, defense_kwargs = get_condition_config(key, args)
     bar = "═" * 65
     print(f"\n{bar}")
     print(f"  CONDITION: {display_label}")
     print(f"{bar}\n")
+
+    seed_everything(args.seed, args.deterministic)
+    reset_loader_seed(train_loader, args.seed)
+    reset_loader_seed(aux_loader, args.seed + 1 if args.seed is not None else None)
 
     # ── Fresh models ──────────────────────────────────────────────────────────
     client_model, server_model = create_split_simple_cnn(
@@ -645,15 +725,20 @@ def run_condition(
     if afo_trainer is not None:
         afo_trainer.save_checkpoint(os.path.join(args.save_dir, f"afo_{safe_key}.pt"))
 
-    return {
+    result = {
         "test_accuracy":   test_acc,
         "ssim":            recon_metrics["ssim"],
         "psnr":            recon_metrics["psnr"],
         "dcor":            recon_metrics["dcor"],
+        "display_label":   display_label,
+        "defense_kwargs":  defense_kwargs,
+        "seed":            args.seed,
         "final_sub_loss":  sl_history["fora_sub_loss"][-1] if sl_history["fora_sub_loss"] else float("nan"),
         "final_mmd_loss":  sl_history["fora_mmd_loss"][-1]  if sl_history["fora_mmd_loss"]  else float("nan"),
         "final_dcor_train": sl_history["dcor_values"][-1],
     }
+    fora.clear_snapshot()
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -674,7 +759,7 @@ def print_summary(results: dict):
     print(div)
 
     for key, res in results.items():
-        label = CONDITIONS[key][0]
+        label = res.get("display_label", CONDITIONS[key][0])
         print(fmt.format(
             label[:col_w],
             f"{res['test_accuracy']*100:.2f}%",
@@ -698,7 +783,7 @@ def print_summary(results: dict):
     for key, res in results.items():
         if key == "vanilla":
             continue
-        label     = CONDITIONS[key][0]
+        label     = res.get("display_label", CONDITIONS[key][0])
         acc_delta = (res["test_accuracy"] - va["test_accuracy"]) * 100
         ssim_delta = va["ssim"] - res["ssim"]   # positive = defense reduces recon quality
         psnr_delta = va["psnr"] - res["psnr"]
@@ -743,6 +828,7 @@ def print_summary(results: dict):
 
 def main(args):
     os.makedirs(args.save_dir, exist_ok=True)
+    seed_everything(args.seed, args.deterministic)
 
     # ── Device ────────────────────────────────────────────────────────────────
     if torch.cuda.is_available():
@@ -763,6 +849,9 @@ def main(args):
     print(f"  λ_mmd         : {args.lambda_mmd}")
     print(f"  Conditions    : {args.conditions}")
     print(f"  Save dir      : {args.save_dir}")
+    print(f"  Data workers  : {args.num_workers}")
+    print(f"  Pin memory    : {args.pin_memory and device.type == 'cuda'}")
+    print(f"  Seed          : {args.seed if args.seed is not None else 'random'}")
     print(f"{'═'*65}")
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -778,9 +867,21 @@ def main(args):
         download=True, transform=_transform_test,
     )
 
-    train_loader, _ = get_dataloader("cifar10", batch_size=args.batch_size)
+    pin_memory = args.pin_memory and device.type == "cuda"
+    train_loader, _ = get_dataloader(
+        "cifar10",
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        seed=args.seed,
+    )
     aux_loader, eval_loader = make_aux_loader(
-        test_dataset_raw, batch_size=args.batch_size, aux_frac=args.aux_frac
+        test_dataset_raw,
+        batch_size=args.batch_size,
+        aux_frac=args.aux_frac,
+        seed=args.seed if args.seed is not None else 42,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
     )
 
     print(f"\n  Data split:")
@@ -790,6 +891,7 @@ def main(args):
 
     # ── Run conditions ────────────────────────────────────────────────────────
     results = {}
+    json_path = os.path.join(args.save_dir, "fora_vs_defenses_results.json")
     for key in args.conditions:
         if key not in CONDITIONS:
             print(f"  [WARNING] Unknown condition '{key}', skipping.")
@@ -804,11 +906,14 @@ def main(args):
         )
         res["cut_layer"] = args.cut_layer
         results[key] = res
+        with open(json_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"  Partial results saved → {json_path}")
+        release_torch_memory(device)
 
     # ── Summary + save ────────────────────────────────────────────────────────
     print_summary(results)
 
-    json_path = os.path.join(args.save_dir, "fora_vs_defenses_results.json")
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"  Results saved → {json_path}")
@@ -842,6 +947,14 @@ if __name__ == "__main__":
                         help="SL learning rate. Default: 1e-3")
     parser.add_argument("--batch-size",     type=int,   default=128,
                         help="Batch size. Default: 128")
+    parser.add_argument("--num-workers",    type=int,   default=0,
+                        help="DataLoader worker processes. Use 0 on memory-constrained Macs. Default: 0")
+    parser.add_argument("--pin-memory",     action="store_true",
+                        help="Enable DataLoader pinned memory. Useful for CUDA, disabled on MPS by default.")
+    parser.add_argument("--seed",           type=int,   default=None,
+                        help="Seed Python, NumPy, PyTorch, data splits, and loader shuffling.")
+    parser.add_argument("--deterministic",  action="store_true",
+                        help="Request deterministic PyTorch algorithms where available.")
 
     # FORA
     parser.add_argument("--inverse-epochs", type=int,   default=30,
@@ -852,6 +965,16 @@ if __name__ == "__main__":
                         help="Fraction of test set used as FORA auxiliary data. Default: 0.1")
     parser.add_argument("--eval-batches",   type=int,   default=20,
                         help="Batches used for reconstruction eval. Default: 20")
+
+    # AFO ablation
+    parser.add_argument("--afo-lambda-reconstruction", type=float, default=None,
+                        help="Override AFO reconstruction-adversary weight.")
+    parser.add_argument("--afo-lambda-feature",        type=float, default=None,
+                        help="Override AFO feature-preservation weight.")
+    parser.add_argument("--afo-obfuscation-strength",  type=float, default=None,
+                        help="Override residual AFO obfuscation strength.")
+    parser.add_argument("--afo-recon-steps",           type=int,   default=None,
+                        help="Override local reconstructor update steps per batch.")
 
     # Convenience
     parser.add_argument("--quick",          action="store_true",
