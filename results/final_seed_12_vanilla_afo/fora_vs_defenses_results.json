@@ -1,0 +1,33 @@
+{
+  "vanilla": {
+    "test_accuracy": 0.7707777777777778,
+    "ssim": 0.5531818926334381,
+    "psnr": 13.153961992263794,
+    "dcor": 0.8630778789520264,
+    "display_label": "Vanilla SL (No Defense)",
+    "defense_kwargs": {},
+    "seed": 12,
+    "final_sub_loss": 2.82745588008705,
+    "final_mmd_loss": 0.07139360904693604,
+    "final_dcor_train": NaN,
+    "cut_layer": 2
+  },
+  "afo": {
+    "test_accuracy": 0.784,
+    "ssim": -0.07430973164737224,
+    "psnr": 4.345690727233887,
+    "dcor": 0.8619628816843032,
+    "display_label": "AFO (rec=0.1, feat=0.01, str=0.35, steps=1)",
+    "defense_kwargs": {
+      "lambda_reconstruction": 0.1,
+      "lambda_feature": 0.01,
+      "obfuscation_strength": 0.35,
+      "recon_steps": 1
+    },
+    "seed": 12,
+    "final_sub_loss": 6.610355277195611,
+    "final_mmd_loss": 0.23598687789019415,
+    "final_dcor_train": 0.9112390676117919,
+    "cut_layer": 2
+  }
+}

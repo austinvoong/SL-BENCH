@@ -1,0 +1,19 @@
+{
+  "afo": {
+    "test_accuracy": 0.7791111111111111,
+    "ssim": 0.46526079177856444,
+    "psnr": 11.351695108413697,
+    "dcor": 0.8483170300722123,
+    "display_label": "AFO (rec=0.1, feat=0.02, str=0.25, steps=1)",
+    "defense_kwargs": {
+      "lambda_reconstruction": 0.1,
+      "lambda_feature": 0.02,
+      "obfuscation_strength": 0.25,
+      "recon_steps": 1
+    },
+    "final_sub_loss": 4.745854513114676,
+    "final_mmd_loss": 0.09212234288530277,
+    "final_dcor_train": 0.9081477460349002,
+    "cut_layer": 2
+  }
+}
