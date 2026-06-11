@@ -4,17 +4,36 @@ Data loaders for split learning experiments.
 Provides unified access to common datasets: MNIST, CIFAR-10, CIFAR-100.
 """
 
+import random
+from typing import Optional, Tuple
+
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from typing import Tuple, Optional
-import os
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Seed Python and NumPy RNGs inside DataLoader worker processes."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _make_generator(seed: Optional[int], offset: int = 0) -> Optional[torch.Generator]:
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(seed + offset)
+    return generator
 
 
 def get_cifar10(
     batch_size: int = 128,
     data_dir: str = "./data",
-    num_workers: int = 2
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Load CIFAR-10 dataset with standard augmentation.
@@ -62,7 +81,9 @@ def get_cifar10(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        generator=_make_generator(seed, 0),
+        worker_init_fn=_seed_worker if seed is not None else None,
     )
     
     test_loader = DataLoader(
@@ -70,7 +91,9 @@ def get_cifar10(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        generator=_make_generator(seed, 1),
+        worker_init_fn=_seed_worker if seed is not None else None,
     )
     
     return train_loader, test_loader
@@ -79,7 +102,9 @@ def get_cifar10(
 def get_mnist(
     batch_size: int = 128,
     data_dir: str = "./data",
-    num_workers: int = 2
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Load MNIST dataset.
@@ -118,7 +143,9 @@ def get_mnist(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        generator=_make_generator(seed, 0),
+        worker_init_fn=_seed_worker if seed is not None else None,
     )
     
     test_loader = DataLoader(
@@ -126,7 +153,9 @@ def get_mnist(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        generator=_make_generator(seed, 1),
+        worker_init_fn=_seed_worker if seed is not None else None,
     )
     
     return train_loader, test_loader
@@ -135,7 +164,9 @@ def get_mnist(
 def get_cifar100(
     batch_size: int = 128,
     data_dir: str = "./data",
-    num_workers: int = 2
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Load CIFAR-100 dataset with standard augmentation.
@@ -183,7 +214,9 @@ def get_cifar100(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        generator=_make_generator(seed, 0),
+        worker_init_fn=_seed_worker if seed is not None else None,
     )
     
     test_loader = DataLoader(
@@ -191,7 +224,9 @@ def get_cifar100(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory,
+        generator=_make_generator(seed, 1),
+        worker_init_fn=_seed_worker if seed is not None else None,
     )
     
     return train_loader, test_loader
@@ -201,7 +236,9 @@ def get_dataloader(
     dataset_name: str,
     batch_size: int = 128,
     data_dir: str = "./data",
-    num_workers: int = 2
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Get data loaders by dataset name.
@@ -224,4 +261,10 @@ def get_dataloader(
     if dataset_name.lower() not in loaders:
         raise ValueError(f"Unknown dataset: {dataset_name}. Choose from {list(loaders.keys())}")
     
-    return loaders[dataset_name.lower()](batch_size, data_dir, num_workers)
+    return loaders[dataset_name.lower()](
+        batch_size=batch_size,
+        data_dir=data_dir,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        seed=seed,
+    )

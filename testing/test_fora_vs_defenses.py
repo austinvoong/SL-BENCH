@@ -685,8 +685,8 @@ def run_condition(
         sub_final = sl_history["fora_sub_loss"][-1]
         mmd_init  = sl_history["fora_mmd_loss"][0]
         mmd_final = sl_history["fora_mmd_loss"][-1]
-        print(f"  Substitute loss: {sub_init:.4f} → {sub_final:.4f}")
-        print(f"  MMD loss:        {mmd_init:.4f} → {mmd_final:.4f} "
+        print(f"  Substitute loss: {sub_init:.4f} -> {sub_final:.4f}")
+        print(f"  MMD loss:        {mmd_init:.4f} -> {mmd_final:.4f} "
               f"({'↓ converging' if mmd_final < mmd_init else '↑ check lr'})")
 
     # ── Phase 2: Train inverse network ────────────────────────────────────────
@@ -908,7 +908,7 @@ def main(args):
         results[key] = res
         with open(json_path, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"  Partial results saved → {json_path}")
+        print(f"  Partial results saved -> {json_path}")
         release_torch_memory(device)
 
     # ── Summary + save ────────────────────────────────────────────────────────
@@ -916,7 +916,7 @@ def main(args):
 
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"  Results saved → {json_path}")
+    print(f"  Results saved -> {json_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
